@@ -5,6 +5,8 @@
 Pony Object-Relational Mapper
 =============================
 
+> **Fork notes:** this fork adds support for Python 3.13 and 3.14 on top of upstream `ponyorm/pony` 0.7.19. Supported Python versions: **3.8 – 3.14**. Tested on CPython 3.14.
+
 Pony is an advanced object-relational mapper. The most interesting feature of Pony is its ability to write queries to the database using Python generator expressions and lambdas. Pony analyzes the abstract syntax tree of the expression and translates it into a SQL query.
 
 Here is an example query in Pony:
