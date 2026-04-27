@@ -1,5 +1,5 @@
 from __future__ import absolute_import, print_function, division
-from pony.py23compat import PY36, PY37, PY38, PY39, PY310, PY311, PY312, PYPY
+from pony.py23compat import PY36, PY37, PY38, PY39, PY310, PY311, PY312, PY313, PY314, PYPY
 
 import sys, types, inspect
 from opcode import opname as opnames, HAVE_ARGUMENT, EXTENDED_ARG, cmp_op
@@ -90,6 +90,15 @@ operator_mapping = {
 }
 
 
+# 3.13+ packed-arg opcodes: oparg is two 4-bit local indices
+double_load_store_ops = frozenset({
+    'LOAD_FAST_LOAD_FAST',
+    'STORE_FAST_LOAD_FAST',
+    'STORE_FAST_STORE_FAST',
+    'LOAD_FAST_BORROW_LOAD_FAST_BORROW',
+})
+
+
 def clean_assign(node):
     if isinstance(node, ast.Assign):
         return node.targets
@@ -99,6 +108,12 @@ def clean_assign(node):
 def make_const(value):
     if is_const(value):
         return value
+    if PY314 and isinstance(value, slice):
+        # 3.14 may surface bare runtime slice objects in co_consts
+        start = ast.Constant(value.start) if value.start is not None else None
+        stop = ast.Constant(value.stop) if value.stop is not None else None
+        step = ast.Constant(value.step) if value.step is not None else None
+        return ast.Slice(start, stop, step)
     if PY39:
         return ast.Constant(value)
     elif PY38:
@@ -194,6 +209,10 @@ class Decompiler(object):
                         oparg = co_code[i] + co_code[i + 1] * 256 + oparg * 65536
                         i += 2
 
+            # 3.13+ inlines CACHE pseudo-instructions in co_code; skip them
+            while i < len(code.co_code) and opnames[code.co_code[i]] == 'CACHE':
+                i += 2
+
             opname = opnames[op].replace('+', '_')
             if op >= HAVE_ARGUMENT:
                 if op in hasconst:
@@ -217,9 +236,19 @@ class Decompiler(object):
                     arg = [i + oparg * (2 if PY310 else 1)
                            * (-1 if 'BACKWARD' in opname else 1)]
                 elif op in haslocal:
-                    arg = [code.co_varnames[oparg]]
+                    if opname in double_load_store_ops:
+                        # 3.13: two 4-bit local indices packed in one byte
+                        arg = [code._varname_from_oparg(oparg >> 4),
+                               code._varname_from_oparg(oparg & 0x0f)]
+                    elif PY313:
+                        # 3.13 made co_varnames incomplete; use the official accessor
+                        arg = [code._varname_from_oparg(oparg)]
+                    else:
+                        arg = [code.co_varnames[oparg]]
                 elif op in hascompare:
-                    if PY312:
+                    if PY313:
+                        oparg >>= 5
+                    elif PY312:
                         oparg >>= 4
                     arg = [cmp_op[oparg]]
                 elif op in hasfree:
@@ -230,7 +259,17 @@ class Decompiler(object):
                     arg = [oparg * (2 if PY310 else 1)]
                 else:
                     arg = [oparg]
+            elif PY313 and opname == 'MAKE_FUNCTION' \
+                    and i < len(code.co_code) and opnames[code.co_code[i]] == 'SET_FUNCTION_ATTRIBUTE':
+                # 3.13: MAKE_FUNCTION lost its argc; the next op carries the flags
+                arg = [code.co_code[i + 1]]
+                i += 2
             else: arg = []
+
+            # 3.13+ NOT_TAKEN is another no-arg pseudo-instruction (does not affect jump targets)
+            while i < len(code.co_code) and opnames[code.co_code[i]] == 'NOT_TAKEN':
+                i += 2
+
             if opname == 'FOR_ITER':
                 decompiler.for_iter_pos = decompiler.pos
             if (opname in ('JUMP_ABSOLUTE', 'JUMP_NO_INTERRUPT')
@@ -362,6 +401,10 @@ class Decompiler(object):
         inplace = opname.startswith('NB_INPLACE_')
         opname = opname.split('_', 2 if inplace else 1)[-1]
 
+        if opname == 'SUBSCR':
+            # 3.13 routes subscription through BINARY_OP
+            return decompiler.BINARY_SUBSCR()
+
         op = {
             "ADD": ast.Add,
             "AND": ast.BitAnd,
@@ -390,7 +433,7 @@ class Decompiler(object):
         end = decompiler.stack.pop()
         start = decompiler.stack.pop()
         node1 = decompiler.stack.pop()
-        node2 = ast.Slice(start, end, ctx=ast.Load())
+        node2 = ast.Slice(start, end)
         return ast.Subscript(value=node1, slice=node2, ctx=ast.Load())
 
     def BINARY_SUBSCR(decompiler):
@@ -502,12 +545,19 @@ class Decompiler(object):
             args = values[:-len(keys)]
             keywords = [ast.keyword(k, v) for k, v in zip(keys, values[-len(keys):])]
 
-        self = decompiler.stack.pop()
-        callable_ = decompiler.stack.pop()
-        if callable_ is None:
-            callable_ = self
+        if PY313:
+            # 3.13 swapped the order: self/NULL is now above the callable on the stack
+            self_ = decompiler.stack.pop()
+            callable_ = decompiler.stack.pop()
+            if self_ is not None:
+                args.insert(0, self_)
         else:
-            args.insert(0, self)
+            self_ = decompiler.stack.pop()
+            callable_ = decompiler.stack.pop()
+            if callable_ is None:
+                callable_ = self_
+            else:
+                args.insert(0, self_)
         decompiler.stack.append(callable_)
         return decompiler._call_function(args, keywords)
 
@@ -536,7 +586,7 @@ class Decompiler(object):
         star = decompiler.stack.pop()
         return decompiler.CALL_FUNCTION(argc, star, star2)
 
-    def CALL_FUNCTION_EX(decompiler, argc):
+    def CALL_FUNCTION_EX(decompiler, argc=1):
         star2 = None
         if argc:
             if argc != 1:
@@ -545,7 +595,70 @@ class Decompiler(object):
         star = decompiler.stack.pop()
         args = [ast.Starred(value=star)] if star else None
         keywords = [ast.keyword(value=star2)] if star2 else None
+        if PY313:
+            # 3.13: self/NULL and callable swapped on the stack; restore for _call_function
+            self_ = decompiler.stack.pop()
+            callable_ = decompiler.stack.pop()
+            decompiler.stack.append(self_)
+            decompiler.stack.append(callable_)
         return decompiler._call_function(args, keywords)
+
+    def CALL_KW(decompiler, argc):
+        # 3.13 replaced KW_NAMES + CALL with CALL_KW carrying the names tuple on the stack
+        names = decompiler.stack.pop()
+        if not isinstance(names, ast.Constant):
+            throw(NotImplementedError, 'CALL_KW with non-constant names: %r' % names)
+        decompiler.kw_names = names.value
+        return decompiler.CALL(argc)
+
+    def CONVERT_VALUE(decompiler, conversion):
+        # 3.13: f-string conversion split out from FORMAT_VALUE.
+        # 0 = no conv (already wouldn't emit this op), 1 = !s, 2 = !r, 3 = !a
+        value = decompiler.stack.pop()
+        return value, [-1, ord('s'), ord('r'), ord('a')][conversion]
+
+    def FORMAT_SIMPLE(decompiler):
+        args = decompiler.stack.pop()
+        if isinstance(args, tuple):
+            value, conversion = args
+        else:
+            value, conversion = args, -1
+        return ast.FormattedValue(value=value, conversion=conversion)
+
+    def FORMAT_WITH_SPEC(decompiler):
+        spec = decompiler.stack.pop()
+        args = decompiler.stack.pop()
+        if isinstance(args, tuple):
+            value, conversion = args
+        else:
+            value, conversion = args, -1
+        return ast.FormattedValue(value=value, conversion=conversion, format_spec=spec)
+
+    def TO_BOOL(decompiler):
+        pass  # 3.13: explicit truthiness coercion; no-op for our AST building
+
+    def LOAD_SMALL_INT(decompiler, value):
+        return make_const(value)
+
+    def LOAD_FAST_LOAD_FAST(decompiler, varname1, varname2):
+        decompiler.names.add(varname1)
+        decompiler.stack.append(ast.Name(varname1, ast.Load()))
+        return decompiler.LOAD_FAST(varname2)
+
+    LOAD_FAST_BORROW_LOAD_FAST_BORROW = LOAD_FAST_LOAD_FAST
+
+    def STORE_FAST_STORE_FAST(decompiler, varname1, varname2):
+        decompiler.STORE_FAST(varname1)
+        decompiler.STORE_FAST(varname2)
+
+    def STORE_FAST_LOAD_FAST(decompiler, varname1, varname2):
+        decompiler.STORE_FAST(varname1)
+        return decompiler.LOAD_FAST(varname2)
+
+    def SET_FUNCTION_ATTRIBUTE(decompiler, flag):
+        # 3.13: this op replaces the argc on MAKE_FUNCTION; we already absorb
+        # it inside get_instructions, so the dispatcher should never reach here.
+        throw(NotImplementedError)
 
     def CALL_METHOD(decompiler, argc):
         pop = decompiler.stack.pop
@@ -797,6 +910,11 @@ class Decompiler(object):
 
     def LOAD_ATTR(decompiler, attr_name, push_null):
         res = ast.Attribute(decompiler.stack.pop(), attr_name, ast.Load())
+        if push_null and PY313:
+            # 3.13 swapped NULL and result order on the stack
+            decompiler.stack.append(res)
+            decompiler.stack.append(None)
+            return None
         if push_null:
             decompiler.stack.append(None)
         return res
@@ -817,12 +935,19 @@ class Decompiler(object):
         return ast.Name(varname, ast.Load())
 
     LOAD_FAST_AND_CLEAR = LOAD_FAST
+    LOAD_FAST_BORROW = LOAD_FAST
 
     def LOAD_GLOBAL(decompiler, varname, push_null):
+        decompiler.names.add(varname)
+        res = ast.Name(varname, ast.Load())
+        if push_null and PY313:
+            # 3.13 swapped NULL and result order on the stack
+            decompiler.stack.append(res)
+            decompiler.stack.append(None)
+            return None
         if push_null:
             decompiler.stack.append(None)
-        decompiler.names.add(varname)
-        return ast.Name(varname, ast.Load())
+        return res
 
     def LOAD_METHOD(decompiler, methname):
         return decompiler.LOAD_ATTR(methname, PY311)
@@ -840,7 +965,7 @@ class Decompiler(object):
         decompiler.stack[-3:-2] = []  # ignore freevars
         return decompiler.MAKE_FUNCTION(argc)
 
-    def MAKE_FUNCTION(decompiler, argc):
+    def MAKE_FUNCTION(decompiler, argc=0):
         defaults = []
         if sys.version_info >= (3, 6):
             if not PY311:

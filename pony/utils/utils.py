@@ -368,27 +368,38 @@ def between(x, a, b):
 def is_utf8(encoding):
     return encoding.upper().replace('_', '').replace('-', '') in ('UTF8', 'UTF', 'U8')
 
-def _persistent_id(obj):
-    if obj is Ellipsis:
-        return "Ellipsis"
+class _PersistentPickler(pickle.Pickler):
+    def persistent_id(self, obj):
+        if obj is Ellipsis:
+            return "Ellipsis"
+        return None
 
-def _persistent_load(persid):
-    if persid == "Ellipsis":
-        return Ellipsis
-    raise pickle.UnpicklingError("unsupported persistent object")
+class _PersistentUnpickler(pickle.Unpickler):
+    def persistent_load(self, persid):
+        if persid == "Ellipsis":
+            return Ellipsis
+        raise pickle.UnpicklingError("unsupported persistent object")
 
 def pickle_ast(val):
     pickled = io.BytesIO()
-    pickler = pickle.Pickler(pickled)
-    pickler.persistent_id = _persistent_id
-    pickler.dump(val)
+    _PersistentPickler(pickled).dump(val)
     return pickled
 
 def unpickle_ast(pickled):
     pickled.seek(0)
-    unpickler = pickle.Unpickler(pickled)
-    unpickler.persistent_load = _persistent_load
-    return unpickler.load()
+    return _PersistentUnpickler(pickled).load()
+
+
+class IntegerGenerator:
+    """Pickleable / deepcopyable replacement for itertools.count() with step=1."""
+    def __init__(self, firstval=0):
+        self.val = firstval
+    def __iter__(self):
+        return self
+    def __next__(self):
+        res = self.val
+        self.val += 1
+        return res
 
 def copy_ast(tree):
     return unpickle_ast(pickle_ast(tree))
